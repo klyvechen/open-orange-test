@@ -34,20 +34,25 @@ OpenOrange agent 協作開發的測試 repo。程式碼由 **Dev**（Claude Code
 - 雙彈跳規則與廚房（禁止截擊區）規則暫不實作
 
 **如何遊玩**
-1. 下載 `pickleball/pickleball.html`
-2. 用 Chrome、Edge 或其他瀏覽器打開
+- 線上遊玩：**https://klyvechen.github.io/open-orange-test/pickleball/**
+- 或下載 `pickleball/index.html`，用 Chrome、Edge 或其他瀏覽器打開
 
 **檔案**
 
 | 檔案 | 說明 |
 |---|---|
 | [`pickleball/SPEC.md`](pickleball/SPEC.md) | 第一版完整規格 |
-| `pickleball/pickleball.html` | 遊戲本體（開發中） |
+| `pickleball/index.html` | 遊戲本體 |
+
+### 🎾 匹克球 3D（`pickleball-3d/`，規劃中）
+
+背後視角的 3D 匹克球：畫面前方是自己的背影，往前是球網和對手。可前後左右移動，有直球、左切、右切、上抽、下切五種擊球。規格見 [`pickleball-3d/SPEC.md`](pickleball-3d/SPEC.md)。
 
 ## 進度
 
 - [x] 第一版規格
-- [ ] 第一版遊戲（Dev 開發中）
-- [ ] GitHub Pages 線上遊玩
+- [x] 第一版遊戲
+- [x] GitHub Pages 線上遊玩
+- [ ] 遊戲二：匹克球 3D
 - [ ] 第二版：新增「困難模式」（左切、右切、上抽、下抽，視角改為俯視或斜視），與一般模式並存，開始畫面可選
 - [ ] 後續：雙打、雙彈跳與廚房規則、音效、手機觸控
