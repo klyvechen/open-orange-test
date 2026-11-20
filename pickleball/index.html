@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>匹克球 Pickleball 2D</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1b2a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+ * 匹克球 2D 模擬遊戲 — 第一版
+ * ---------------------------------------------------------------------
+ * 座標系（世界單位：英尺 ft、秒 s）
+ *   x：球場長度方向，網子在 x = 0。玩家在左半場 (x < 0)，電腦在右半場 (x > 0)。
+ *      底線在 x = ±22（單打球場長 44 ft），廚房線在 x = ±7。
+ *   y：高度，地面 y = 0。網高 34 英寸（約 2.83 ft）。
+ *
+ * 計分（簡化）：採「每球得分制」(rally scoring)：每一球不論誰發球，贏球的一方得 1 分，
+ *   並由贏球方發下一球。先到 11 分且領先 2 分者獲勝。
+ *   （正式匹克球單打只有發球方能得分；第一版為了簡單、節奏快而簡化。）
+ * 省略的規則：雙彈跳規則、廚房（非截擊區）規則、發球落入廚房、發球左右區。
+ *
+ * 操作：← → / A D 移動；K 直球、J 正旋（上旋）、L 逆旋（下旋）；↑/W 打深、↓/S 打短；空白鍵發球。
+ *
+ * 來球旋轉的影響（CFG.SPIN_REACT，玩家與 AI 都適用）：
+ *   回擊正旋來球 → 出球角度偏高、球速偏快（容易彈飛出界）
+ *   回擊逆旋來球 → 出球角度偏低、球速偏慢（容易掛網）
+ *   偏差大小 = 來球擊球瞬間的旋轉量 × 回擊方式倍率：
+ *     順旋（正旋回正旋、逆旋回逆旋）倍率小、直球硬碰居中、逆著旋轉（正旋回逆旋…）倍率大且較不穩。
+ *
+ * 程式區塊：CONFIG → 工具函式 → 物理 → 擊球解算（含來球旋轉反應）→ 遊戲狀態/規則 → AI → 輸入 → 繪圖 → 主迴圈
+ *
+ * 第二版預留（尚未實作）：困難模式 K 直球、J 左切、L 右切、I 上抽、逗號鍵下抽。
+ *   左右切需要球場寬度方向 (z 軸)，屆時要把 ball 加上 z/vz、旋轉改成向量 {top, side}，
+ *   畫面改俯視或斜視 2.5D。按鍵對應已集中在 KEYMAPS，新增 hard 模式時從那裡擴充。
+ * ===================================================================== */
+
+/* ============================== CONFIG ============================== */
+const CFG = {
+  DT: 1 / 60,            // 固定物理步長 60Hz
+  G: 32.2,               // 重力 ft/s^2
+  DRAG: 0.0045,          // 二次空氣阻力係數 (1/ft)：a = -k|v|v
+  MAGNUS: 0.20,          // Magnus 係數：a = k * spin * (v 的垂直向量)
+  SPIN_DECAY: 0.15,      // 每秒旋轉衰減比例
+  BALL_R: 0.12,          // 實際球半徑（ft）；畫面上會放大顯示
+  NET_H: 34 / 12,        // 網子中央高度 34 英寸
+  COURT_HALF: 22,        // 底線位置
+  KITCHEN: 7,            // 廚房線離網距離
+  PLAYER_SPEED: 16,      // 玩家移動速度 ft/s
+  AI_SPEED: 14,          // 電腦移動速度 ft/s
+  // 擊球範圍（相對球員，dx 以「面向網子方向」為正）
+  REACH_BACK: -1.0, REACH_FRONT: 3.2, REACH_LOW: 0.1, REACH_HIGH: 6.8,
+  SWEET: 1.3,            // 最佳擊球點：身前 1.3 ft
+  SWING_TIME: 0.28,      // 揮拍動畫秒數
+  SWING_BUFFER: 0.2,     // 按鍵緩衝：按下後 0.2 秒內球進入範圍仍算擊中
+  WIN_SCORE: 11,
+  AI_REACT_MIN: 0.18, AI_REACT_RAND: 0.17,  // 電腦反應延遲
+  AI_AIM_NOISE: 0.45,    // 電腦站位誤差 (ft)
+  AI_WHIFF: 0.04,        // 電腦揮空機率
+  AI_SHOT_ERR: 0.55,     // 電腦擊球誤差倍率
+
+  // ---- 來球旋轉對回擊的影響（可調）----
+  // s = 擊球瞬間來球的旋轉量（+ 上旋 / - 下旋；落地後已衰減，截擊時較大）
+  // 出球角度偏差(度) = ANGLE * s * 倍率；球速偏差比例 = SPEED * s * 倍率；
+  // 額外隨機散布(度) = SCATTER * |s| * 倍率（讓逆著旋轉回擊更不穩）
+  SPIN_REACT: {
+    ANGLE: 7,            // 每單位旋轉造成的出球角度偏差（度）
+    SPEED: 0.07,         // 每單位旋轉造成的球速偏差比例
+    SCATTER: 3,          // 每單位旋轉造成的額外隨機角度散布（度）
+    WITH: 0.4,           // 順旋回擊（同球種）倍率：最好控制
+    FLAT: 1.0,           // 直球硬碰倍率
+    AGAINST: 1.5,        // 逆著旋轉回擊（相反球種）倍率：最難控制
+    AI_READ: 0.35,       // 電腦會預先修正的比例（0 = 不修正，1 = 完全抵銷）
+    AI_MATCH: 0.35,      // 電腦刻意「順旋回擊」的機率（其餘隨機選球種）
+  },
+};
+
+// 三種球種：spin 正值=上旋、負值=下旋；clear=希望過網高度餘裕；depth=預設落點離網距離
+const SPINS = {
+  flat:  { key: 'flat',  name: '直球（平擊）', short: '直球', spin: 0,    clear: 1.6, depth: 15, color: '#ffffff' },
+  top:   { key: 'top',   name: '正旋（上旋）', short: '正旋', spin: 1.0,  clear: 1.1, depth: 17, color: '#ff9c40' },
+  slice: { key: 'slice', name: '逆旋（下旋）', short: '逆旋', spin: -0.8, clear: 2.3, depth: 12, color: '#4fc3ff' },
+};
+
+/* ============================== 工具函式 ============================== */
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rand = (a, b) => a + Math.random() * (b - a);
+function gauss() { // 近似常態分佈，截斷在 ±2.5
+  let s = 0; for (let i = 0; i < 6; i++) s += Math.random();
+  return clamp((s - 3) * Math.SQRT2, -2.5, 2.5);
+}
+const sideName = s => (s === 'player' ? '你' : '電腦');
+
+/* ============================== 物理 ============================== */
+// 加速度：重力 + Magnus + 空氣阻力。
+// Magnus 方向取速度的垂直向量 (vy, -vx) * dir：
+//   dir=擊球方向(+1 往右 / -1 往左)。上旋時球往前飛會受向下的力，下旋則向上。
+function accel(b) {
+  const sp = Math.hypot(b.vx, b.vy);
+  const m = CFG.MAGNUS * b.spin * b.dir;
+  return {
+    ax: m * b.vy - CFG.DRAG * sp * b.vx,
+    ay: -CFG.G - m * b.vx - CFG.DRAG * sp * b.vy,
+  };
+}
+
+// 推進一顆球一個步長（含觸網、落地反彈）。emit(event, ball) 回報事件給規則系統。
+// 同一個函式也被 AI 拿來預測球路（emit 傳入自己的紀錄函式）。
+function stepBall(b, dt, emit) {
+  const { ax, ay } = accel(b);
+  b.vx += ax * dt; b.vy += ay * dt;            // 半隱式 Euler
+  const px = b.x, py = b.y;
+  b.x += b.vx * dt; b.y += b.vy * dt;
+
+  // --- 穿越網子平面 x = 0 ---
+  if ((px < 0) !== (b.x < 0)) {
+    const t = px / (px - b.x);
+    const yc = py + (b.y - py) * t;              // 內插出過網瞬間的高度
+    if (yc < CFG.NET_H + CFG.BALL_R) {
+      b.x = px < 0 ? -CFG.BALL_R : CFG.BALL_R;   // 打到網：彈回並失速
+      b.vx = -b.vx * 0.15; b.vy *= 0.3; b.spin *= 0.2;
+      emit && emit('net', b);
+    } else {
+      emit && emit('cross', b);
+    }
+  }
+
+  // --- 落地 ---
+  if (b.y < CFG.BALL_R) {
+    b.y = CFG.BALL_R;
+    if (b.vy < -1.5) {
+      // 反彈依旋轉調整：
+      //   上旋 s=+1：e=0.50（彈得低）、水平 ×1.10（往前衝）
+      //   直球 s=0 ：e=0.62、水平 ×0.80
+      //   下旋 s=-0.8：e≈0.72（彈得較高）、水平 ×0.56（明顯煞住）
+      const s = b.spin;
+      const e = 0.62 - 0.12 * s;
+      const f = 0.80 + 0.30 * s;
+      b.vy = -b.vy * e;
+      b.vx *= f;
+      b.spin *= 0.35;
+      b.bounces++;
+      emit && emit('bounce', b);
+    } else if (b.vy <= 0) {
+      if (!b.rolling) { b.rolling = true; b.bounces++; emit && emit('bounce', b); }
+      b.vy = 0;
+      b.vx *= Math.pow(0.3, dt);                 // 滾動摩擦
+    }
+  }
+
+  b.spin *= (1 - CFG.SPIN_DECAY * dt);
+  b.rot += (b.spin * 22 + b.vx * 0.15) * b.dir * dt * (b.spin === 0 ? 0 : 1);
+}
+
+// 只模擬飛行（不含反彈/觸網），回傳落地點與過網高度。給擊球解算用。
+function simFlight(x, y, vx, vy, spin, dir) {
+  const b = { x, y, vx, vy, spin, dir };
+  const dt = CFG.DT;
+  let netY = null;
+  for (let i = 0; i < 600; i++) {
+    const { ax, ay } = accel(b);
+    b.vx += ax * dt; b.vy += ay * dt;
+    const px = b.x, py = b.y;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    b.spin *= (1 - CFG.SPIN_DECAY * dt);
+    if (netY === null && (px < 0) !== (b.x < 0)) netY = py + (b.y - py) * (px / (px - b.x));
+    if (b.y <= CFG.BALL_R && b.vy < 0) return { landX: b.x, netY, t: (i + 1) * dt };
+  }
+  return { landX: b.x, netY, t: 600 * dt };
+}
+
+/* ============================== 擊球解算 ============================== */
+// 給定擊球點、方向、旋轉、目標落點（離網距離 depth）與希望的過網餘裕 clear，
+// 掃描發射角度，每個角度用二分法找出落在目標的速度，再挑過網高度最接近期望者。
+// 這樣三種球種都會用同一套物理自然呈現出不同球路（上旋低平、下旋高飄）。
+function solveShot(x0, y0, dir, spin, depth, clear) {
+  const targetX = dir * depth;
+  let best = null;
+  for (let deg = -30; deg <= 62; deg += 2) {
+    const a = deg * Math.PI / 180;
+    let lo = 5, hi = 110, res = null;
+    for (let i = 0; i < 16; i++) {
+      const v = (lo + hi) / 2;
+      res = simFlight(x0, y0, dir * Math.cos(a) * v, Math.sin(a) * v, spin, dir);
+      if (res.landX * dir < depth) lo = v; else hi = v;
+    }
+    const speed = (lo + hi) / 2;
+    res = simFlight(x0, y0, dir * Math.cos(a) * speed, Math.sin(a) * speed, spin, dir);
+    if (Math.abs(res.landX - targetX) > 1.5 || res.netY === null) continue;
+    const margin = res.netY - CFG.NET_H;
+    const score = Math.abs(margin - clear) + (margin < 0.35 ? 50 : 0) + speed * 0.004;
+    if (!best || score < best.score) best = { angle: a, speed, score, margin };
+  }
+  return best || { angle: 35 * Math.PI / 180, speed: 38, score: 99, margin: 0 };
+}
+
+/* ============================== 遊戲狀態 ============================== */
+const game = {
+  state: 'title',   // title | serve | rally | pointOver | gameOver
+  score: { player: 0, ai: 0 },
+  server: 'player',
+  lastHitter: null,
+  lastShot: null,   // { who, type }
+  rally: 0,         // 本球來回拍數
+  msg: '', msgT: 0,
+  timer: 0,
+  winner: null,
+  time: 0,
+  autoPlayer: false, // 測試/展示用：讓 AI 代打玩家
+};
+
+const ball = {
+  x: 0, y: 2, vx: 0, vy: 0, spin: 0, dir: 1, rot: 0,
+  bounces: 0, crossed: false, rolling: false, held: true, type: 'flat', trail: [],
+};
+
+function makePaddler(side, dir, speed) {
+  return {
+    side, dir, speed, x: -dir * 20, vx: 0,
+    swingT: 0, swingType: null, swingBuf: 0, bufType: null,
+    brain: { react: 0, plan: null, serveT: 0 },
+  };
+}
+const paddlers = {
+  player: makePaddler('player', +1, CFG.PLAYER_SPEED),
+  ai: makePaddler('ai', -1, CFG.AI_SPEED),
+};
+const other = p => (p.side === 'player' ? paddlers.ai : paddlers.player);
+const otherSide = s => (s === 'player' ? 'ai' : 'player');
+
+function showMsg(text, t = 1.8) { game.msg = text; game.msgT = t; }
+
+function startMatch() {
+  game.score = { player: 0, ai: 0 };
+  game.server = 'player';
+  game.winner = null;
+  game.lastShot = null;
+  setupServe();
+  showMsg('比賽開始！', 1.2);
+}
+
+// 每一分開始：發球方站到底線後，接發球方站到底線前
+function setupServe() {
+  game.state = 'serve';
+  game.lastHitter = null;
+  game.rally = 0;
+  for (const p of Object.values(paddlers)) {
+    p.x = p.side === game.server ? -p.dir * 23 : -p.dir * 19;
+    p.swingT = 0; p.swingBuf = 0;
+    p.brain.plan = null; p.brain.react = 0;
+    p.brain.serveT = 1.0;
+  }
+  Object.assign(ball, { vx: 0, vy: 0, spin: 0, bounces: 0, crossed: false, rolling: false, held: true, trail: [] });
+  holdBall();
+}
+
+function holdBall() {
+  const s = paddlers[game.server];
+  ball.x = s.x + s.dir * 0.9;
+  ball.y = 1.6;
+}
+
+/* ============================== 擊球 ============================== */
+function inReach(p) {
+  const dx = (ball.x - p.x) * p.dir;
+  return dx >= CFG.REACH_BACK && dx <= CFG.REACH_FRONT && ball.y >= CFG.REACH_LOW && ball.y <= CFG.REACH_HIGH;
+}
+// 能否擊球：來回中、對方剛擊出、球已過網且在我方半場、還沒落地兩次、在擊球範圍內
+function canHit(p) {
+  return game.state === 'rally' && game.lastHitter !== p.side && ball.crossed &&
+    ball.x * p.dir < 0 && ball.bounces < 2 && inReach(p);
+}
+
+// 擊球品質 0~1：越接近最佳擊球點越好；太低的球扣分
+function hitQuality(p) {
+  const dx = (ball.x - p.x) * p.dir;
+  let q = 1 - Math.min(1, Math.abs(dx - CFG.SWEET) / 2.3);
+  if (ball.y < 0.6) q -= 0.25;
+  return clamp(q, 0, 1);
+}
+
+// ---- 來球旋轉反應 ----
+// 回擊方式：with = 順旋（同球種）、against = 逆著旋轉（相反球種）、flat = 直球硬碰、none = 來球無旋轉
+const REL_NAME = { with: '順旋回擊', against: '逆旋轉回擊', flat: '直球硬碰', none: '' };
+function spinRelation(inType, retType) {
+  if (!inType || inType === 'flat') return 'none';
+  if (retType === 'flat') return 'flat';
+  return inType === retType ? 'with' : 'against';
+}
+// 依來球旋轉計算回擊偏差。read = 擊球者預先修正的比例（玩家 0，電腦 CFG.SPIN_REACT.AI_READ）
+function spinResponse(inType, inSpin, retType, read = 0) {
+  const R = CFG.SPIN_REACT;
+  const rel = spinRelation(inType, retType);
+  const mult = rel === 'with' ? R.WITH : rel === 'against' ? R.AGAINST : rel === 'flat' ? R.FLAT : 0;
+  return {
+    rel, mult,
+    dAng: R.ANGLE * inSpin * mult * (1 - read),   // 度；正旋 → 正（偏高），逆旋 → 負（偏低）
+    dSpd: R.SPEED * inSpin * mult * (1 - read),   // 比例；正旋 → 較快，逆旋 → 較慢
+    scatter: R.SCATTER * Math.abs(inSpin) * mult, // 度
+  };
+}
+
+// 計算一拍的實際出球（解算 → 來球旋轉偏差 → 隨機誤差）。noise=false 時只回傳系統性偏差，供測試。
+function computeShot(x, y, dir, type, depth, err, incoming, read, noise = true) {
+  const S = SPINS[type];
+  const sol = solveShot(x, y, dir, S.spin, depth, S.clear);
+  const r = incoming ? spinResponse(incoming.type, incoming.spin, type, read)
+                     : { rel: 'none', mult: 0, dAng: 0, dSpd: 0, scatter: 0 };
+  const n1 = noise ? gauss() : 0, n2 = noise ? gauss() : 0;
+  const ang = sol.angle + (r.dAng + n1 * (err * 2.2 + r.scatter)) * Math.PI / 180;
+  const spd = sol.speed * (1 + r.dSpd + n2 * err * 0.05);
+  return { ang, spd, sol, resp: r };
+}
+
+// 共用擊球：設定球速與旋轉、更新狀態
+function hitBall(p, type, depth, err) {
+  const S = SPINS[type];
+  const incoming = ball.held ? null : { type: ball.type, spin: ball.spin };   // 發球沒有來球
+  const read = p.side === 'ai' ? CFG.SPIN_REACT.AI_READ : 0;
+  const { ang, spd, resp } = computeShot(ball.x, ball.y, p.dir, type, depth, err, incoming, read);
+  ball.vx = p.dir * Math.cos(ang) * spd;
+  ball.vy = Math.sin(ang) * spd;
+  ball.spin = S.spin * rand(0.9, 1.1);
+  ball.dir = p.dir;
+  ball.bounces = 0; ball.crossed = false; ball.rolling = false; ball.held = false;
+  ball.type = type;
+  game.lastHitter = p.side;
+  game.lastShot = { who: p.side, type, inType: incoming && resp.rel !== 'none' ? incoming.type : null, rel: resp.rel };
+  game.rally++;
+  p.swingT = CFG.SWING_TIME; p.swingType = type; p.swingBuf = 0;
+  const o = other(p);                         // 對手開始反應
+  o.brain.react = CFG.AI_REACT_MIN + Math.random() * CFG.AI_REACT_RAND;
+  o.brain.plan = null;
+}
+
+function doServe(p, type) {
+  if (game.state !== 'serve' || game.server !== p.side) return;
+  game.state = 'rally';
+  hitBall(p, type, rand(13, 18), 0.35);
+}
+
+function playerHit(type) {
+  const p = paddlers.player;
+  const q = hitQuality(p);
+  // ↑/W 打深、↓/S 打短（放小球）
+  let depth = SPINS[type].depth + rand(-1, 1);
+  if (keys.ArrowUp || keys.KeyW) depth += 4;
+  if (keys.ArrowDown || keys.KeyS) depth -= 7;
+  hitBall(p, type, clamp(depth, 3.5, 21), 0.3 + (1 - q) * 1.1);
+}
+
+/* ============================== 規則 ============================== */
+function pointTo(winner, reason) {
+  if (game.state !== 'rally') return;
+  game.score[winner]++;
+  game.server = winner;                       // 每球得分制：贏球方發下一球
+  game.state = 'pointOver';
+  game.timer = 1.8;
+  game.lastReason = reason;
+  showMsg(`${reason}！${winner === 'player' ? '你得分' : '電腦得分'}`, 1.8);
+  const a = game.score[winner], b = game.score[otherSide(winner)];
+  if (a >= CFG.WIN_SCORE && a - b >= 2) game.winner = winner;
+}
+
+// 球的事件 → 判定得失分
+function onBallEvent(ev, b) {
+  if (game.state !== 'rally') return;
+  const hitter = game.lastHitter, receiver = otherSide(hitter);
+  if (ev === 'net' && b.bounces === 0) pointTo(receiver, '掛網');
+  else if (ev === 'cross' && b.bounces === 0) b.crossed = true;
+  else if (ev === 'bounce') {
+    if (!b.crossed) pointTo(receiver, '未過網');
+    else if (b.bounces === 1) {
+      if (Math.abs(b.x) > CFG.COURT_HALF) pointTo(receiver, '出界');
+    } else pointTo(hitter, '兩次落地');
+  }
+}
+
+/* ============================== 電腦 AI ============================== */
+// 預測來球：複製球的狀態，用同一套 stepBall 往前模擬，找出「來得及跑到」的擊球點。
+function planIntercept(p) {
+  const b = { ...ball, trail: null };
+  let netted = false, firstBounceX = null;
+  const emit = (ev, bb) => {
+    if (ev === 'net' && bb.bounces === 0) netted = true;
+    if (ev === 'bounce' && firstBounceX === null) firstBounceX = bb.x;
+  };
+  const reach = [], all = [];
+  for (let i = 1; i <= 240 && !netted && b.bounces < 2; i++) {
+    stepBall(b, CFG.DT, emit);
+    const t = i * CFG.DT;
+    if (b.x * p.dir < 0 && b.y >= 0.35 && b.y <= 5.5 && (b.bounces === 1 || b.y >= 1.4)) {
+      const px = b.x - p.dir * CFG.SWEET;       // 要站的位置
+      if (px * p.dir > -0.6) continue;           // 不能過網
+      const c = { x: px, t, bounced: b.bounces === 1, y: b.y };
+      all.push(c);
+      if (Math.abs(px - p.x) <= p.speed * t * 0.95) reach.push(c);
+    }
+  }
+  const home = { x: -p.dir * 13, play: false };
+  if (netted) return home;
+  // 預測會出界：大多數時候不接
+  if (firstBounceX !== null && Math.abs(firstBounceX) > CFG.COURT_HALF + 0.3 && Math.random() < 0.85) {
+    return { x: p.x, play: false };
+  }
+  const pick = reach.find(c => c.bounced && c.y >= 1.0) || reach[0] || all[0];
+  if (!pick) return home;
+  return {
+    x: pick.x + gauss() * CFG.AI_AIM_NOISE,
+    play: true,
+    whiff: Math.random() < CFG.AI_WHIFF,
+  };
+}
+
+function moveToward(p, tx, dt) {
+  const d = tx - p.x;
+  const step = p.speed * dt;
+  p.vx = Math.abs(d) <= step ? d / dt : Math.sign(d) * p.speed;
+  p.x += Math.abs(d) <= step ? d : Math.sign(d) * step;
+}
+
+function randomSpinType() {
+  const r = Math.random();
+  return r < 0.4 ? 'flat' : r < 0.7 ? 'top' : 'slice';
+}
+
+function aiHit(p) {
+  const q = hitQuality(p);
+  // 來球有旋轉時，有一定機率選擇順著旋轉回擊（較穩），否則隨機
+  const type = ball.type !== 'flat' && Math.random() < CFG.SPIN_REACT.AI_MATCH ? ball.type : randomSpinType();
+  const depth = type === 'slice' && Math.random() < 0.35 ? rand(4.5, 8) : rand(8, 19);
+  hitBall(p, type, depth, CFG.AI_SHOT_ERR * (0.6 + (1 - q) * 1.4));
+}
+
+// AI 主邏輯（電腦用；autoPlayer 模式也拿來代打玩家）
+function brainUpdate(p, dt) {
+  const B = p.brain;
+  p.vx = 0;
+  if (game.state === 'serve') {
+    if (game.server === p.side) {
+      B.serveT -= dt;
+      if (B.serveT <= 0) doServe(p, randomSpinType());
+    }
+    return;
+  }
+  if (game.state !== 'rally') return;
+  if (game.lastHitter === p.side) {             // 球往對面飛：回到準備位置
+    moveToward(p, -p.dir * 13, dt);
+    return;
+  }
+  if (B.react > 0) { B.react -= dt; return; }   // 反應延遲
+  if (!B.plan) B.plan = planIntercept(p);
+  const plan = B.plan;
+  moveToward(p, plan.x, dt);
+  if (plan.play && canHit(p)) {
+    const dx = (ball.x - p.x) * p.dir;
+    const urgent = dx < 0.2 || (ball.bounces === 1 && ball.y < 0.6 && ball.vy < 0);
+    if (Math.abs(dx - CFG.SWEET) < 0.7 || urgent) {
+      if (plan.whiff) { plan.play = false; p.swingT = CFG.SWING_TIME; p.swingType = 'flat'; return; }
+      aiHit(p);
+    }
+  }
+}
+
+/* ============================== 輸入 ============================== */
+const keys = {};
+// 按鍵對應（第一版 normal 模式）。第二版困難模式預計：K 直球、J 左切、L 右切、I 上抽、逗號鍵下抽（尚未實作）
+const KEYMAPS = {
+  normal: { KeyK: 'flat', KeyJ: 'top', KeyL: 'slice' },
+};
+const SWING_KEYS = KEYMAPS.normal;
+
+addEventListener('keydown', e => {
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
+  if (e.repeat) return;
+  keys[e.code] = true;
+  onKeyPress(e.code);
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+function onKeyPress(code) {
+  if (game.state === 'title' || game.state === 'gameOver') {
+    if (code === 'Space' || code === 'Enter') startMatch();
+    return;
+  }
+  const p = paddlers.player;
+  if (game.state === 'serve' && game.server === 'player' && !game.autoPlayer) {
+    if (code === 'Space') doServe(p, 'flat');
+    else if (SWING_KEYS[code]) doServe(p, SWING_KEYS[code]);
+    return;
+  }
+  if (SWING_KEYS[code] && game.state === 'rally' && !game.autoPlayer) {
+    // 開始揮拍並緩衝，球在緩衝時間內進入範圍就算擊中
+    p.swingBuf = CFG.SWING_BUFFER; p.bufType = SWING_KEYS[code];
+    p.swingT = CFG.SWING_TIME; p.swingType = SWING_KEYS[code];
+  }
+}
+
+function updatePlayerInput(dt) {
+  const p = paddlers.player;
+  let mv = 0;
+  if (keys.ArrowLeft || keys.KeyA) mv -= 1;
+  if (keys.ArrowRight || keys.KeyD) mv += 1;
+  p.vx = mv * p.speed;
+  p.x += p.vx * dt;
+  if (p.swingBuf > 0) {
+    if (canHit(p)) playerHit(p.bufType);
+    else p.swingBuf -= dt;
+  }
+}
+
+function clampPaddler(p) {
+  // 不能越過網子；發球時要站在底線後
+  let lo = -p.dir * 31, hi = -p.dir * 0.6;
+  if (game.state === 'serve' && game.server === p.side) hi = -p.dir * 22.2;
+  p.x = clamp(p.x, Math.min(lo, hi), Math.max(lo, hi));
+}
+
+// 滑鼠/觸控：開始或再玩一次
+let uiButton = null;
+canvas_click: {
+  const cv = document.getElementById('game');
+  cv.addEventListener('pointerdown', e => {
+    if (game.state === 'title') startMatch();
+    else if (game.state === 'gameOver' && uiButton) {
+      const { x, y, w, h } = uiButton;
+      if (e.clientX >= x && e.clientX <= x + w && e.clientY >= y && e.clientY <= y + h) startMatch();
+    }
+  });
+}
+
+/* ============================== 更新 ============================== */
+function update(dt) {
+  game.time += dt;
+  if (game.msgT > 0) game.msgT -= dt;
+  for (const p of Object.values(paddlers)) p.swingT = Math.max(0, p.swingT - dt);
+  if (game.state === 'title' || game.state === 'gameOver') return;
+
+  if (game.autoPlayer) brainUpdate(paddlers.player, dt); else updatePlayerInput(dt);
+  brainUpdate(paddlers.ai, dt);
+  for (const p of Object.values(paddlers)) clampPaddler(p);
+
+  if (game.state === 'serve') {
+    holdBall();
+  } else {
+    stepBall(ball, dt, onBallEvent);
+    ball.trail.push({ x: ball.x, y: ball.y });
+    if (ball.trail.length > 18) ball.trail.shift();
+  }
+
+  if (game.state === 'pointOver') {
+    game.timer -= dt;
+    if (game.timer <= 0) {
+      if (game.winner) game.state = 'gameOver';
+      else setupServe();
+    }
+  }
+}
+
+/* ============================== 繪圖 ============================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const view = { W: 0, H: 0, scale: 20, cx: 0, groundY: 0 };
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  view.W = innerWidth; view.H = innerHeight;
+  canvas.width = Math.round(view.W * dpr); canvas.height = Math.round(view.H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  view.groundY = view.H * 0.74;
+  view.scale = Math.min(view.W / 64, (view.groundY - 90) / 11);
+  view.cx = view.W / 2;
+}
+addEventListener('resize', resize);
+resize();
+
+const sx = x => view.cx + x * view.scale;
+const sy = y => view.groundY - y * view.scale;
+
+function drawCourt() {
+  const { W, H, scale } = view;
+  const gy = view.groundY;
+  // 天空
+  const sky = ctx.createLinearGradient(0, 0, 0, gy);
+  sky.addColorStop(0, '#16324f'); sky.addColorStop(1, '#3f7cac');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, gy);
+  // 場外地面
+  ctx.fillStyle = '#2f5d3a'; ctx.fillRect(0, gy, W, H - gy);
+  // 球場（側視為一條帶狀）
+  const band = Math.max(10, scale * 0.6);
+  ctx.fillStyle = '#2f6fa8'; ctx.fillRect(sx(-22), gy, sx(22) - sx(-22), band);
+  ctx.fillStyle = '#3d9a63'; ctx.fillRect(sx(-7), gy, sx(7) - sx(-7), band);  // 廚房
+  // 線
+  ctx.fillStyle = '#fff';
+  for (const x of [-22, -7, 7, 22]) ctx.fillRect(sx(x) - 1.5, gy - 3, 3, band + 3);
+  ctx.fillRect(sx(-22), gy - 1, sx(22) - sx(-22), 2);
+  // 標籤
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.font = `${Math.max(11, scale * 0.55)}px sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText('廚房', sx(-3.5), gy + band + 4);
+  ctx.fillText('廚房', sx(3.5), gy + band + 4);
+  ctx.fillText('底線', sx(-22), gy + band + 4);
+  ctx.fillText('底線', sx(22), gy + band + 4);
+  ctx.fillText('廚房線 7ft', sx(-7), gy + band + 4 + Math.max(13, scale * 0.65));
+  ctx.fillText('廚房線 7ft', sx(7), gy + band + 4 + Math.max(13, scale * 0.65));
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillText('你的半場', sx(-14.5), gy + band + 4);
+  ctx.fillText('電腦半場', sx(14.5), gy + band + 4);
+}
+
+function drawNet() {
+  const top = sy(CFG.NET_H), gy = view.groundY;
+  const x = sx(0), w = Math.max(6, view.scale * 0.35);
+  ctx.fillStyle = 'rgba(20,20,20,0.55)';
+  ctx.fillRect(x - w / 2, top, w, gy - top);
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let y = top; y < gy; y += 5) { ctx.moveTo(x - w / 2, y); ctx.lineTo(x + w / 2, y); }
+  ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.fillRect(x - w / 2 - 1, top - 3, w + 2, 4);   // 網帶
+  ctx.fillStyle = '#ddd'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+  ctx.fillText('34"', x, top - 5);
+}
+
+function drawPaddler(p, color) {
+  const s = view.scale, d = p.dir;
+  const fx = sx(p.x), gy = view.groundY;
+  const hipY = sy(3.0), shY = sy(4.6), headY = sy(5.25);
+  const run = Math.sin(game.time * 14) * Math.min(1, Math.abs(p.vx) / 6);
+  ctx.lineCap = 'round';
+  // 陰影
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath(); ctx.ellipse(fx, gy, s * 0.9, s * 0.18, 0, 0, Math.PI * 2); ctx.fill();
+  // 腿
+  ctx.strokeStyle = '#222'; ctx.lineWidth = Math.max(3, s * 0.22);
+  ctx.beginPath();
+  ctx.moveTo(fx, hipY); ctx.lineTo(fx + (0.5 + run * 0.4) * s, gy);
+  ctx.moveTo(fx, hipY); ctx.lineTo(fx - (0.5 + run * 0.4) * s, gy);
+  ctx.stroke();
+  // 身體
+  ctx.strokeStyle = color; ctx.lineWidth = Math.max(5, s * 0.5);
+  ctx.beginPath(); ctx.moveTo(fx, hipY); ctx.lineTo(fx, shY); ctx.stroke();
+  // 頭
+  ctx.fillStyle = '#f1c27d';
+  ctx.beginPath(); ctx.arc(fx, headY, s * 0.42, 0, Math.PI * 2); ctx.fill();
+  // 手臂 + 球拍：揮拍時從後下方掃到前上方
+  let phi;
+  if (p.swingT > 0) {
+    const k = 1 - p.swingT / CFG.SWING_TIME;   // 0→1
+    phi = (-130 + 190 * Math.min(1, k * 1.6)) * Math.PI / 180;
+  } else phi = -35 * Math.PI / 180;
+  const arm = 1.6 * s;
+  const hx = fx + Math.cos(phi) * arm * d, hy = shY - Math.sin(phi) * arm;
+  ctx.strokeStyle = '#f1c27d'; ctx.lineWidth = Math.max(3, s * 0.18);
+  ctx.beginPath(); ctx.moveTo(fx, shY); ctx.lineTo(hx, hy); ctx.stroke();
+  const px = hx + Math.cos(phi) * 0.9 * s * d, py = hy - Math.sin(phi) * 0.9 * s;
+  ctx.strokeStyle = p.swingT > 0 && p.swingType ? SPINS[p.swingType].color : '#333';
+  ctx.lineWidth = Math.max(5, s * 0.45);
+  ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(px, py); ctx.stroke();
+  // 擊球範圍提示（玩家，淡淡的）
+  if (p.side === 'player' && (game.state === 'rally')) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)'; ctx.lineWidth = 1;
+    ctx.strokeRect(sx(p.x + CFG.REACH_BACK), sy(CFG.REACH_HIGH),
+      (CFG.REACH_FRONT - CFG.REACH_BACK) * s, (CFG.REACH_HIGH - CFG.REACH_LOW) * s);
+  }
+}
+
+function drawBall() {
+  const s = view.scale;
+  const r = Math.max(6, s * 0.32);             // 放大顯示
+  const S = SPINS[ball.type] || SPINS.flat;
+  // 地面陰影
+  const a = clamp(0.45 - ball.y * 0.03, 0.08, 0.45);
+  ctx.fillStyle = `rgba(0,0,0,${a})`;
+  ctx.beginPath(); ctx.ellipse(sx(ball.x), view.groundY, r * 1.1, r * 0.3, 0, 0, Math.PI * 2); ctx.fill();
+  // 拖尾（顏色代表球種）
+  if (!ball.held) {
+    ball.trail.forEach((t, i) => {
+      const k = i / ball.trail.length;
+      ctx.globalAlpha = k * 0.35;
+      ctx.fillStyle = S.color;
+      ctx.beginPath(); ctx.arc(sx(t.x), sy(t.y), r * (0.4 + 0.5 * k), 0, Math.PI * 2); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  }
+  const bx = sx(ball.x), by = Math.min(sy(ball.y), view.groundY - r * 0.6);
+  // 超出畫面上方時顯示箭頭
+  if (by < 0) {
+    ctx.fillStyle = '#d8f34a';
+    ctx.beginPath(); ctx.moveTo(bx, 6); ctx.lineTo(bx - 7, 18); ctx.lineTo(bx + 7, 18); ctx.fill();
+    return;
+  }
+  ctx.fillStyle = '#d8f34a';
+  ctx.strokeStyle = '#7a8a1a'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(bx, by, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  // 旋轉標記：兩條穿過球心的線，隨 ball.rot 轉動
+  ctx.strokeStyle = '#4a5a00'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (const off of [0, Math.PI / 2]) {
+    const c = Math.cos(ball.rot + off) * r * 0.8, d = Math.sin(ball.rot + off) * r * 0.8;
+    ctx.moveTo(bx - c, by - d); ctx.lineTo(bx + c, by + d);
+  }
+  ctx.stroke();
+  // 旋轉方向箭頭（弧形）
+  if (!ball.held && Math.abs(ball.spin) > 0.05) {
+    const cw = ball.spin * ball.dir > 0;        // 畫面上順時針？
+    const R = r + 5, a0 = ball.rot * 0.5, len = 1.5;
+    const a1 = a0 + (cw ? len : -len);
+    ctx.strokeStyle = S.color; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(bx, by, R, a0, a1, !cw); ctx.stroke();
+    const ex = bx + Math.cos(a1) * R, ey = by + Math.sin(a1) * R;
+    const tang = a1 + (cw ? Math.PI / 2 : -Math.PI / 2);
+    ctx.fillStyle = S.color;
+    ctx.beginPath();
+    ctx.moveTo(ex + Math.cos(tang) * 6, ey + Math.sin(tang) * 6);
+    ctx.lineTo(ex + Math.cos(tang + 2.4) * 6, ey + Math.sin(tang + 2.4) * 6);
+    ctx.lineTo(ex + Math.cos(tang - 2.4) * 6, ey + Math.sin(tang - 2.4) * 6);
+    ctx.fill();
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+function drawHUD() {
+  const { W } = view;
+  // 比分
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  roundRect(W / 2 - 150, 10, 300, 62, 10); ctx.fill();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 30px sans-serif';
+  ctx.fillStyle = '#7cc4ff'; ctx.fillText(game.score.player, W / 2 - 60, 36);
+  ctx.fillStyle = '#fff'; ctx.fillText(':', W / 2, 36);
+  ctx.fillStyle = '#ff8a80'; ctx.fillText(game.score.ai, W / 2 + 60, 36);
+  ctx.font = '13px sans-serif'; ctx.fillStyle = '#ddd';
+  ctx.fillText('你', W / 2 - 110, 36); ctx.fillText('電腦', W / 2 + 110, 36);
+  ctx.fillText(`發球方：${sideName(game.server)}　｜　來回 ${game.rally} 拍`, W / 2, 61);
+
+  // 上一拍球種
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.font = '15px sans-serif'; ctx.fillStyle = '#ccc';
+  ctx.fillText('上一拍：', 14, 14);
+  if (game.lastShot) {
+    const S = SPINS[game.lastShot.type];
+    ctx.fillStyle = S.color; ctx.font = 'bold 17px sans-serif';
+    ctx.fillText(`${S.name}`, 14, 34);
+    ctx.font = '13px sans-serif'; ctx.fillStyle = '#ccc';
+    ctx.fillText(`（${sideName(game.lastShot.who)}擊出）`, 14, 56);
+    if (game.lastShot.inType) {
+      ctx.fillText(`來球 ${SPINS[game.lastShot.inType].short} → ${REL_NAME[game.lastShot.rel]}`, 14, 74);
+    }
+  } else { ctx.fillStyle = '#888'; ctx.fillText('—', 14, 34); }
+
+  // 操作提示
+  ctx.textAlign = 'right'; ctx.font = '13px sans-serif'; ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  const lines = ['← → / A D：移動', 'K 直球　J 正旋　L 逆旋', '↑/W 打深　↓/S 打短', '空白鍵：發球'];
+  lines.forEach((l, i) => ctx.fillText(l, W - 14, 14 + i * 18));
+
+  // 發球提示
+  if (game.state === 'serve' && game.server === 'player') {
+    ctx.textAlign = 'center'; ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#ffe082';
+    ctx.fillText('輪到你發球：按 空白鍵（直球）或 K / J / L 選球種發球', W / 2, 84);
+  }
+  // 得失分訊息
+  if (game.msgT > 0 && game.msg) {
+    ctx.globalAlpha = clamp(game.msgT / 0.4, 0, 1);
+    ctx.font = 'bold 30px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const w = ctx.measureText(game.msg).width + 40;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; roundRect(W / 2 - w / 2, 110, w, 50, 10); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillText(game.msg, W / 2, 136);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawOverlay(title, lines, buttonText) {
+  const { W, H } = view;
+  ctx.fillStyle = 'rgba(5,15,30,0.78)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#d8f34a'; ctx.font = 'bold 40px sans-serif';
+  let y = Math.max(60, H / 2 - 40 - lines.length * 13);
+  ctx.fillText(title, W / 2, y); y += 50;
+  ctx.font = `${Math.round(clamp(W / 56, 11, 17))}px sans-serif`; ctx.fillStyle = '#e8eef5';
+  for (const l of lines) { ctx.fillText(l, W / 2, y); y += 26; }
+  uiButton = null;
+  if (buttonText) {
+    const w = 200, h = 50, x = W / 2 - w / 2; y += 14;
+    ctx.fillStyle = '#d8f34a'; roundRect(x, y, w, h, 12); ctx.fill();
+    ctx.fillStyle = '#16324f'; ctx.font = 'bold 20px sans-serif';
+    ctx.fillText(buttonText, W / 2, y + h / 2);
+    uiButton = { x, y, w, h };
+  }
+}
+
+function render() {
+  ctx.clearRect(0, 0, view.W, view.H);
+  drawCourt();
+  drawNet();
+  drawPaddler(paddlers.player, '#3fa9f5');
+  drawPaddler(paddlers.ai, '#ef5350');
+  if (game.state !== 'title') drawBall();
+  drawHUD();
+  if (game.state === 'title') {
+    drawOverlay('匹克球 Pickleball 2D', [
+      '單打：你（左，藍） vs 電腦（右，紅）',
+      '← → 或 A / D：左右移動　　↑/W 打深、↓/S 打短',
+      'K：直球（平擊）　J：正旋（上旋，低平下墜、落地前衝）　L：逆旋（下旋，飄、落地煞住）',
+      '回擊正旋來球容易彈高出界、回擊逆旋來球容易掛網；順著來球旋轉回擊最好控制',
+      '球進入身前的擊球範圍時按下才會擊中（可稍微提早按）',
+      '空白鍵：發球（也可用 K/J/L 發該球種）',
+      '規則：掛網、出界、兩次落地失分；每球得分制，先到 11 分且領先 2 分獲勝',
+    ], '開始（空白鍵）');
+  } else if (game.state === 'gameOver') {
+    const win = game.winner === 'player';
+    drawOverlay(win ? '🎉 你贏了！' : '電腦獲勝', [
+      `最終比分　你 ${game.score.player} : ${game.score.ai} 電腦`,
+    ], '再玩一次');
+  }
+}
+
+/* ============================== 主迴圈 ============================== */
+// 固定步長累加器：畫面幀率不影響物理結果
+let lastT = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min(0.25, (now - lastT) / 1000);
+  lastT = now;
+  while (acc >= CFG.DT) { update(CFG.DT); acc -= CFG.DT; }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// 測試/除錯用接口
+window.PB = { game, ball, paddlers, CFG, SPINS, update, render, startMatch, solveShot, simFlight, stepBall, computeShot, spinResponse };
+</script>
+</body>
+</html>
